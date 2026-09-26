@@ -59,6 +59,7 @@
         <button class="tab active" id="tab-order" role="tab" aria-selected="true" type="button">顺序 <span id="order-count" class="count">0</span></button>
         <button class="tab" id="tab-excluded" role="tab" aria-selected="false" type="button">排除与诊断 <span id="excluded-count" class="count">0</span></button>
         <button class="tab" id="tab-modal" role="tab" aria-selected="false" type="button">模态审计 <span id="modal-count" class="count">0</span></button>
+        <button class="tab" id="tab-visual" role="tab" aria-selected="false" type="button">视觉顺序 <span id="visual-count" class="count">0</span></button>
         <button class="tab" id="tab-baseline" role="tab" aria-selected="false" type="button">基线对比 <span id="baseline-count" class="count">0</span></button>
       </div>
       <ol id="order-list" class="order-list" aria-label="Tab 顺序"></ol>
@@ -77,6 +78,14 @@
         <h3>审计诊断</h3>
         <ul id="modal-diagnostics-list" class="diagnostics-list"></ul>
         <p id="modal-hint" class="diff-hint" role="status"></p>
+      </div>
+      <div id="visual-panel" class="visual-panel" hidden>
+        <p id="visual-meta" class="visual-meta"></p>
+        <h3>偏差（相邻 Tab 对与视觉顺序相反）</h3>
+        <ul id="visual-deviation-list" class="visual-list"></ul>
+        <h3>无法判定（不计作无偏差）</h3>
+        <ul id="visual-undetermined-list" class="visual-list"></ul>
+        <p id="visual-hint" class="diff-hint" role="status"></p>
       </div>
       <div id="baseline-panel" class="baseline-panel" hidden>
         <div class="baseline-toolbar">

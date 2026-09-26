@@ -13,11 +13,16 @@
  *     宿主轻 DOM 节点列为「不可确定」，并给出诊断；
  *  4. 模态焦点陷阱审计：在组合树范围内识别可见 dialog[open] /
  *     aria-modal="true" 容器，拆分「模态内循环」与「模态外泄漏」；
- *  5. 通过 postMessage 与父页面通信：上报路线、接收高亮指令、绘制高亮框。
+ *  5. 视觉顺序审计：采集 Tab 顺序节点的实际矩形（getBoundingClientRect）
+ *     与最近滚动容器，仅比较同一滚动容器内可明确排序的节点，按行与文档
+ *     LTR/RTL 方向建立视觉顺序，找出与 Tab 路线相邻却逆向跳转的焦点对；
+ *     零尺寸 / 矩形重叠 / 行归属不唯一 / 跨滚动容器的节点标为无法判定，
+ *     不计作无偏差；
+ *  6. 通过 postMessage 与父页面通信：上报路线、接收高亮指令、绘制高亮框。
  *
  * 文件顶部的纯函数（parseTabIndexValue / computeOrder / buildDiagnostics /
  * pickActiveModal / computeModalCycle / buildModalDiagnostics /
- * parseRoute / formatRoute / buildShadowDiagnostics）
+ * parseRoute / formatRoute / buildShadowDiagnostics / auditVisualOrder）
  * 不依赖 DOM，会在 Node 环境下导出，供单元测试使用。
  */
 (function () {
@@ -324,6 +329,252 @@
     return diags;
   }
 
+  /* ---------------- 视觉顺序审计（纯函数） ---------------- */
+
+  /** 行归属判定的垂直重叠容差（px）：重叠高度大于该值才视为同一行 / 跨行 */
+  var ROW_OVERLAP_TOLERANCE = 2;
+
+  /** 两个矩形是否存在正面积重叠（仅共边不算重叠） */
+  function rectsOverlap(r1, r2) {
+    return r1.left < r2.left + r2.width && r2.left < r1.left + r1.width &&
+           r1.top < r2.top + r2.height && r2.top < r1.top + r1.height;
+  }
+
+  /** 垂直区间 [aTop,aBottom] 与 [bTop,bBottom] 的重叠高度（不相交时为负） */
+  function verticalOverlap(aTop, aBottom, bTop, bBottom) {
+    return Math.min(aBottom, bBottom) - Math.max(aTop, bTop);
+  }
+
+  /** 几何类「无法判定」原因（节点固有，与相邻对是否跨容器无关） */
+  var GEOMETRIC_REASONS = { 'zero-size': true, 'rect-overlap': true, 'row-ambiguous': true };
+
+  /**
+   * 视觉顺序审计：比较「实际视觉顺序」与「Tab 顺序」。
+   *
+   * @param {Array} nodes Tab 顺序中的节点（数组顺序必须就是 Tab 顺序），每个为：
+   *   { step, selector, label, rect:{left,top,width,height}, container }
+   *   rect 为视口坐标矩形；container 为最近滚动容器身份（同一字符串即可比较）。
+   * @param {{direction?:string}} options direction 为文档方向 'ltr' / 'rtl'
+   *
+   * 判定规则：
+   *  1. 零尺寸矩形 → 无法判定（zero-size）；
+   *  2. 与同一滚动容器内其他节点的矩形正面积重叠 → 无法判定（rect-overlap）；
+   *  3. 行聚类：同一容器内，垂直区间存在公共重叠（> 2px）的节点聚为一行，
+   *     行带取成员垂直区间的交集（避免高节点把多行桥接成一行）；
+   *     节点区间与多个最终行带重叠 → 行归属不唯一（row-ambiguous）；
+   *  4. 行内按文档方向排序（LTR：左缘升序；RTL：右缘降序）得到视觉顺序；
+   *  5. 仅评判「相邻 Tab 对」：
+   *     · 含几何类无法判定节点的对不评判；
+   *     · 两节点分属不同滚动容器 → 不评判，且两节点记 cross-scroll-container；
+   *     · 同行内视觉顺序相反 → inline-backward；
+   *     · 跳回更靠上的行 → row-backward；向下跳行（前进方向）不算偏差。
+   *
+   * @returns {{direction:string, deviations:Array, undetermined:Array, stats:object}}
+   */
+  function auditVisualOrder(nodes, options) {
+    var direction = (options && options.direction === 'rtl') ? 'rtl' : 'ltr';
+
+    // 归一化输入：数组顺序即 Tab 顺序；step 为节点身份（1 基 Tab 序号）
+    var list = (nodes || []).map(function (n) {
+      var r = (n && n.rect) || {};
+      return {
+        step: n && n.step,
+        selector: (n && n.selector) || null,
+        label: (n && n.label) || null,
+        rect: {
+          left: Number(r.left) || 0,
+          top: Number(r.top) || 0,
+          width: Number(r.width) || 0,
+          height: Number(r.height) || 0
+        },
+        container: (n && n.container) || 'document'
+      };
+    });
+
+    var deviations = [];
+    var undetermined = [];
+    var reasonByStep = Object.create(null); // step → 原因码（每节点只记首个原因）
+
+    function markUndetermined(n, reason, message) {
+      if (reasonByStep[n.step]) return;
+      reasonByStep[n.step] = reason;
+      undetermined.push({
+        step: n.step,
+        selector: n.selector,
+        label: n.label,
+        reason: reason,
+        container: n.container,
+        message: message
+      });
+    }
+
+    function groupByContainer(arr) {
+      var map = Object.create(null);
+      arr.forEach(function (n) {
+        (map[n.container] = map[n.container] || []).push(n);
+      });
+      return map;
+    }
+
+    // 1) 零尺寸矩形：无法确定视觉位置
+    var sizable = [];
+    list.forEach(function (n) {
+      if (n.rect.width > 0 && n.rect.height > 0) sizable.push(n);
+      else markUndetermined(n, 'zero-size', '节点矩形尺寸为零（未布局或已折叠），无法确定其视觉位置');
+    });
+
+    // 2) 矩形重叠：同一滚动容器内与其他节点正面积相交 → 无法明确排序
+    var sizableGroups = groupByContainer(sizable);
+    Object.keys(sizableGroups).forEach(function (cid) {
+      var g = sizableGroups[cid];
+      for (var i = 0; i < g.length; i++) {
+        for (var j = i + 1; j < g.length; j++) {
+          if (rectsOverlap(g[i].rect, g[j].rect)) {
+            markUndetermined(g[i], 'rect-overlap',
+              '节点矩形与同容器内第 ' + g[j].step + ' 步节点的矩形重叠，无法明确排序');
+            markUndetermined(g[j], 'rect-overlap',
+              '节点矩形与同容器内第 ' + g[i].step + ' 步节点的矩形重叠，无法明确排序');
+          }
+        }
+      }
+    });
+    var clean = sizable.filter(function (n) { return !reasonByStep[n.step]; });
+
+    // 3) 行聚类（按容器分组）：行带为成员垂直区间的公共交集；
+    //    节点区间与自身行带以外的行带也重叠（> 容差）→ 行归属不唯一
+    var rowOfStep = Object.create(null);    // step → 行号（0 基，按行带 top 升序）
+    var visualOfStep = Object.create(null); // step → 行内视觉位次（0 基）
+    var cleanGroups = groupByContainer(clean);
+    Object.keys(cleanGroups).forEach(function (cid) {
+      var g = cleanGroups[cid].slice().sort(function (a, b) {
+        return (a.rect.top - b.rect.top) || (a.rect.left - b.rect.left) || (a.step - b.step);
+      });
+      var rows = []; // { top, bottom, members }，top/bottom 为成员区间的公共交集
+      g.forEach(function (n) {
+        var r = n.rect;
+        var bottom = r.top + r.height;
+        for (var k = 0; k < rows.length; k++) {
+          var row = rows[k];
+          if (verticalOverlap(r.top, bottom, row.top, row.bottom) > ROW_OVERLAP_TOLERANCE) {
+            row.members.push(n);
+            row.top = Math.max(row.top, r.top);
+            row.bottom = Math.min(row.bottom, bottom);
+            return;
+          }
+        }
+        rows.push({ top: r.top, bottom: bottom, members: [n] });
+      });
+      rows.forEach(function (row, ri) {
+        row.members.forEach(function (n) {
+          var r = n.rect;
+          for (var k = 0; k < rows.length; k++) {
+            if (k === ri) continue;
+            if (verticalOverlap(r.top, r.top + r.height, rows[k].top, rows[k].bottom) > ROW_OVERLAP_TOLERANCE) {
+              markUndetermined(n, 'row-ambiguous', '节点垂直区间跨越多行，行归属不唯一，无法确定视觉顺序');
+              break;
+            }
+          }
+        });
+      });
+      // 剔除无法判定成员后的最终行带，按 top 升序编号
+      var finalRows = rows.map(function (row) {
+        return {
+          top: row.top,
+          members: row.members.filter(function (n) { return !reasonByStep[n.step]; })
+        };
+      }).filter(function (row) { return row.members.length > 0; });
+      finalRows.sort(function (a, b) { return a.top - b.top; });
+      finalRows.forEach(function (row, ri) {
+        // 4) 行内视觉顺序：LTR 按左缘升序，RTL 按右缘降序（平局按 top、Tab 序号）
+        row.members.sort(function (a, b) {
+          var d = direction === 'rtl'
+            ? (b.rect.left + b.rect.width) - (a.rect.left + a.rect.width)
+            : a.rect.left - b.rect.left;
+          if (d !== 0) return d;
+          return (a.rect.top - b.rect.top) || (a.step - b.step);
+        });
+        row.members.forEach(function (n, vi) {
+          rowOfStep[n.step] = ri;
+          visualOfStep[n.step] = vi;
+        });
+      });
+    });
+
+    // 5) 相邻 Tab 对评判
+    var pairs = Math.max(0, list.length - 1);
+    var comparablePairs = 0;
+    for (var p = 0; p + 1 < list.length; p++) {
+      var a = list[p];
+      var b = list[p + 1];
+      if (GEOMETRIC_REASONS[reasonByStep[a.step]] || GEOMETRIC_REASONS[reasonByStep[b.step]]) continue;
+      if (a.container !== b.container) {
+        // 跨滚动容器：对不评判，且两个节点都标为无法判定（不影响它们与同容器
+        // 其他相邻节点的评判——cross-scroll-container 不是几何类原因）
+        markUndetermined(a, 'cross-scroll-container',
+          '与相邻 Tab 节点（第 ' + b.step + ' 步）分属不同滚动容器，跨容器视觉顺序无法判定');
+        markUndetermined(b, 'cross-scroll-container',
+          '与相邻 Tab 节点（第 ' + a.step + ' 步）分属不同滚动容器，跨容器视觉顺序无法判定');
+        continue;
+      }
+      comparablePairs++;
+      var ra = rowOfStep[a.step];
+      var rb = rowOfStep[b.step];
+      if (ra === rb) {
+        var va = visualOfStep[a.step];
+        var vb = visualOfStep[b.step];
+        if (vb < va) {
+          deviations.push({
+            type: 'inline-backward',
+            fromStep: a.step,
+            toStep: b.step,
+            fromSelector: a.selector,
+            toSelector: b.selector,
+            fromLabel: a.label,
+            toLabel: b.label,
+            fromRow: ra + 1,
+            toRow: rb + 1,
+            fromVisual: va + 1,
+            toVisual: vb + 1,
+            container: a.container,
+            message: '同行逆向：第 ' + b.step + ' 步视觉上位于第 ' + a.step + ' 步的' +
+              (direction === 'rtl' ? '右' : '左') + '侧（行内视觉第 ' + (vb + 1) +
+              ' 个 ← 第 ' + (va + 1) + ' 个），Tab 顺序却相反'
+          });
+        }
+      } else if (rb < ra) {
+        deviations.push({
+          type: 'row-backward',
+          fromStep: a.step,
+          toStep: b.step,
+          fromSelector: a.selector,
+          toSelector: b.selector,
+          fromLabel: a.label,
+          toLabel: b.label,
+          fromRow: ra + 1,
+          toRow: rb + 1,
+          container: a.container,
+          message: '跨行逆向：从视觉第 ' + (ra + 1) + ' 行跳回更靠上的第 ' + (rb + 1) + ' 行'
+        });
+      }
+      // rb > ra：向下跳行（前进方向），不算偏差
+    }
+
+    undetermined.sort(function (x, y) { return x.step - y.step; });
+
+    return {
+      direction: direction,
+      deviations: deviations,
+      undetermined: undetermined,
+      stats: {
+        nodes: list.length,
+        pairs: pairs,
+        comparablePairs: comparablePairs,
+        deviationCount: deviations.length,
+        undeterminedCount: undetermined.length
+      }
+    };
+  }
+
   // Node 环境：导出纯函数供测试，随后退出（不触碰 DOM）。
   if (typeof window === 'undefined' || typeof document === 'undefined') {
     if (typeof module !== 'undefined' && module.exports) {
@@ -336,7 +587,8 @@
         buildShadowDiagnostics: buildShadowDiagnostics,
         pickActiveModal: pickActiveModal,
         computeModalCycle: computeModalCycle,
-        buildModalDiagnostics: buildModalDiagnostics
+        buildModalDiagnostics: buildModalDiagnostics,
+        auditVisualOrder: auditVisualOrder
       };
     }
     return;
@@ -1308,6 +1560,87 @@
     };
   }
 
+  /* ---------------- 视觉顺序审计（DOM 采集） ---------------- */
+
+  /** overflow 计算值为该集合之一时，元素视为滚动容器（clip-only 的 hidden 不算） */
+  var SCROLLABLE_OVERFLOW = { auto: true, scroll: true, overlay: true };
+
+  /**
+   * 组合（扁平化）树父节点：被 slot 分配的节点其视觉祖先为接收 slot，
+   * 其次物理父元素，shadow root 顶层元素接续到宿主。
+   * 滚动裁剪沿扁平化树发生（slotted 节点可能被 shadow 内的 overflow 容器裁剪）。
+   */
+  function composedParent(el) {
+    if (el.assignedSlot) return el.assignedSlot;
+    var p = el.parentElement;
+    if (p) return p;
+    var rt = el.getRootNode();
+    if (rt instanceof ShadowRoot) return rt.host;
+    return null;
+  }
+
+  /** 最近的滚动容器（沿组合祖先链，跨 open shadow / slot 边界）；无则为文档根滚动元素 */
+  function scrollContainerOf(el) {
+    var node = composedParent(el);
+    while (node && node.nodeType === 1) {
+      var cs = getComputedStyle(node);
+      if (SCROLLABLE_OVERFLOW[cs.overflowX] || SCROLLABLE_OVERFLOW[cs.overflowY]) return node;
+      node = composedParent(node);
+    }
+    return document.scrollingElement || document.documentElement;
+  }
+
+  /**
+   * 视觉顺序审计：采集 Tab 顺序节点的实际矩形（getBoundingClientRect，视口坐标）
+   * 与最近滚动容器，运行纯函数 auditVisualOrder；同时输出滚动容器目录
+   * （id / 类型 / 标签 / 分段选择器）供父页面展示与导出。
+   * 文档方向取 <html> 的计算 direction（LTR/RTL）。
+   */
+  function computeVisualAudit() {
+    var direction = 'ltr';
+    try {
+      if (getComputedStyle(document.documentElement).direction === 'rtl') direction = 'rtl';
+    } catch (e) { /* 保持 ltr */ }
+
+    var containers = [];          // [{ id, kind, label, selector }]
+    var containerIds = new Map(); // 容器元素 → id
+    function containerIdFor(el) {
+      if (containerIds.has(el)) return containerIds.get(el);
+      var isDoc = el === (document.scrollingElement || document.documentElement);
+      var id = isDoc ? 'document' : 'c' + (containers.length + 1);
+      containerIds.set(el, id);
+      containers.push({
+        id: id,
+        kind: isDoc ? 'document' : 'element',
+        label: isDoc ? '文档根滚动容器' : describe(el).css,
+        selector: isDoc ? null : stableRoute(el)
+      });
+      return id;
+    }
+
+    var nodes = [];
+    for (var i = 0; i < order.length; i++) {
+      var e = entries[order[i]];
+      // 不在文档中的元素得到全零矩形 → 由纯函数标为 zero-size
+      var r = e.el.getBoundingClientRect();
+      nodes.push({
+        step: i + 1,
+        selector: e.selector,
+        label: e.label,
+        rect: {
+          left: Math.round(r.left * 100) / 100,
+          top: Math.round(r.top * 100) / 100,
+          width: Math.round(r.width * 100) / 100,
+          height: Math.round(r.height * 100) / 100
+        },
+        container: containerIdFor(scrollContainerOf(e.el))
+      });
+    }
+    var result = auditVisualOrder(nodes, { direction: direction });
+    result.containers = containers;
+    return result;
+  }
+
   function computeAndSend() {
     try {
       buildEntries();
@@ -1332,6 +1665,7 @@
           order: order.map(function (idx) { return serialized[idx].selector; }),
           diagnostics: diagnostics,
           modalAudit: computeModalAudit(),
+          visualAudit: computeVisualAudit(),
           stats: {
             candidates: entries.length,
             ordered: order.length,

@@ -11,7 +11,11 @@ DOM 嵌套（`details`、`fieldset[disabled]` 等）与 **Shadow DOM / slot 组�
 （新增 / 移除 / 移位 / 状态切换），并对可见的 `dialog[open]` / `aria-modal="true"`
 容器（含位于 shadow 内部 / 经 slot 分配者）做**模态焦点陷阱审计**
 （活动模态身份、模态内焦点循环、模态外泄漏节点、无可聚焦项 / 缺少可访问名称诊断），
-可一键导出「节点（含宿主链 / slot 来源）/ 顺序 / 诊断 / 基线对比 / 模态审计 / 组合树汇总」JSON 报告。
+并基于预览中的**实际布局矩形**做**视觉顺序审计**（仅比较同一滚动容器内可明确排序的
+相邻 Tab 对：按行与文档 LTR/RTL 方向建立视觉顺序，找出与 Tab 路线相邻却逆向跳转的
+焦点对；零尺寸 / 矩形重叠 / 行归属不唯一 / 跨滚动容器的节点标为无法判定，不计作无偏差），
+可一键导出「节点（含宿主链 / slot 来源）/ 顺序 / 诊断 / 基线对比 / 模态审计 /
+视觉顺序审计 / 组合树汇总」JSON 报告。
 **closed shadow root 明确标记为不可检查，实验室不猜测其内部焦点顺序。**
 
 ## 快速开始（Docker）
@@ -118,6 +122,22 @@ npm run smoke      # 冒烟测试（需服务已启动）
   - **泄漏节点**：模态打开时仍可从模态外 Tab 到达的节点，点击以虚线框高亮；
   - **审计诊断**：模态内无可聚焦项（无法形成循环）、缺少可访问名称、
     焦点泄漏、多模态并存等。
+- **视觉顺序审计**：每次重算时在预览 iframe 内采集 Tab 顺序节点的**实际矩形**
+  （`getBoundingClientRect`，视口坐标）与最近滚动容器（组合祖先链上
+  `overflow-x/y` 为 `auto` / `scroll` / `overlay` 者；slotted 节点沿其接收
+  slot 向上查找；无则为文档根滚动容器），**仅比较同一滚动容器内可明确排序的节点**：
+  - **行与视觉顺序**：垂直区间存在公共重叠（> 2px）的节点聚为同一行（行带取
+    成员区间的交集，避免高节点把多行桥接成一行），行内按文档方向排序
+    （LTR 左→右 / RTL 右→左），行间自上而下；
+  - **偏差**：相邻 Tab 对的视觉顺序与 Tab 顺序相反——同行内逆向
+    （`inline-backward`）或跳回更靠上的行（`row-backward`）；向下跳行
+    （前进方向）不算偏差；
+  - **无法判定**（明确列出，不计作无偏差）：零尺寸矩形（`zero-size`）、
+    与同容器节点矩形正面积重叠（`rect-overlap`，仅共边不算）、行归属不唯一
+    （`row-ambiguous`，垂直区间跨越多行）、与相邻 Tab 节点分属不同滚动容器
+    （`cross-scroll-container`；该标记不影响此节点与同容器相邻节点的评判）；
+  - 点击偏差项会**依次高亮**前后两个节点（复用现有预览高亮），
+    点击无法判定项高亮对应节点；标签角标计数 = 偏差数 + 无法判定数。
 - **导出 JSON**：`POST /api/export` 返回 `Content-Disposition: attachment` 的报告文件；
   接口不可用时退化为浏览器本地下载。已钉基线时，报告包含
   `baselineComparison` 字段：`baseline` / `current` 摘要（时间、统计、节点数）、
@@ -125,6 +145,12 @@ npm run smoke      # 冒烟测试（需服务已启动）
   `diffs`（逐条差异）。存在活动模态时，报告包含 `modalAudit` 字段：
   `activeModal`（活动模态身份与可访问名称）、`cycle`（模态内循环顺序）、
   `leaks`（泄漏节点）、`diagnostics`（审计诊断）与 `candidates`（全部可见模态候选）。
+  报告还包含 `visualAudit` 字段：`direction`（文档方向 `ltr`/`rtl`）、
+  `containers`（滚动容器目录：`id` / `kind` / `label` / 分段选择器）、
+  `deviations`（偏差：`type`、前后节点 Tab 序号与选择器、行号 / 行内位次、
+  所在容器与说明）、`undetermined`（无法判定节点：Tab 序号、选择器、原因码、
+  所在容器与原因说明）与 `stats`（节点数 / 相邻对数 / 可判定对数 /
+  偏差与无法判定计数）。
   检测到 Shadow DOM 时，报告包含 `shadowDom` 字段（open/closed 根宿主、
   经 slot 分配 / fallback / 未分配 / fallback 抑制计数，closed 根含宿主选择器）；
   每个节点的 `shadow` 对象保留 `hosts`（宿主链：label + 分段选择器）、
@@ -140,11 +166,14 @@ public/app.js             父页面：DSD 感知净化、srcdoc 装配、postMes
                           shadow 徽章（宿主链 / slot 来源）、基线面板、模态审计视图、导出
 public/analyzer.js        注入 sandbox iframe：组合树遍历（open shadow / slot 分配 /
                           fallback / 未分配）、焦点模型、分段选择器、节点身份（含宿主链）、
-                          closed 根「不可检查」标记、跨边界模态审计、高亮绘制
+                          closed 根「不可检查」标记、跨边界模态审计、视觉顺序审计
+                          （矩形 / 滚动容器采集、行聚类、LTR/RTL 逆序对检测）、高亮绘制
 public/diff.js            基线对比纯函数：节点身份匹配（uid → 指纹 → 歧义未匹配）与差异计算
 test/analyzer.test.js     纯函数单元测试（tabindex 解析 / 排序 / 诊断 / 模态审计）
 test/shadow.test.js       Shadow 纯函数单元测试（分段选择器往返 / 组合树诊断）
 test/diff.test.js         基线对比单元测试（身份匹配 / 移位 / 状态切换 / 歧义）
+test/visual.test.js       视觉顺序审计单元测试（LTR/RTL 行内 / 跨行逆向、行聚类、
+                          零尺寸 / 矩形重叠 / 行归属不唯一 / 跨滚动容器）
 test/shadow-integration.js jsdom 集成：组合树遍历 / slot / closed / 跨边界模态（需可选 jsdom）
 test/sanitize-dsd.js      jsdom 集成：声明式 Shadow DOM 净化 / 还原（需可选 jsdom）
 test/smoke.js             冒烟测试

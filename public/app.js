@@ -12,8 +12,11 @@
  *     状态切换与未匹配项，点击差异项联动预览高亮；
  *  6. 模态焦点陷阱审计：展示活动模态身份、模态内焦点循环路线、模态外
  *     泄漏节点与审计诊断，点击循环 / 泄漏节点联动预览高亮；
- *  7. 汇总报告（含基线摘要、匹配结果与差异、模态审计）经 POST /api/export
- *     导出为 JSON 附件。
+ *  7. 视觉顺序审计：展示同一滚动容器内相邻 Tab 对的视觉顺序偏差
+ *     （行内逆向 / 跨行逆向）与无法判定节点（零尺寸 / 矩形重叠 /
+ *     行归属不唯一 / 跨滚动容器），点击条目联动预览高亮；
+ *  8. 汇总报告（含基线摘要、匹配结果与差异、模态审计、视觉顺序审计）
+ *     经 POST /api/export 导出为 JSON 附件。
  */
 (function () {
   'use strict';
@@ -67,7 +70,14 @@
     modalCycleWrap: document.getElementById('modal-cycle-wrap'),
     modalLeakList: document.getElementById('modal-leak-list'),
     modalDiagnosticsList: document.getElementById('modal-diagnostics-list'),
-    modalHint: document.getElementById('modal-hint')
+    modalHint: document.getElementById('modal-hint'),
+    tabVisual: document.getElementById('tab-visual'),
+    visualPanel: document.getElementById('visual-panel'),
+    visualCount: document.getElementById('visual-count'),
+    visualMeta: document.getElementById('visual-meta'),
+    visualDeviationList: document.getElementById('visual-deviation-list'),
+    visualUndeterminedList: document.getElementById('visual-undetermined-list'),
+    visualHint: document.getElementById('visual-hint')
   };
 
   var state = {
@@ -82,7 +92,8 @@
     baseline: null,      // 已钉住的基线快照 { pinnedAt, stats, entries }
     diff: null,          // 最近一次基线对比结果（FocusDiff.diffRoutes 返回值）
     modalAudit: null,    // 最近一次模态焦点陷阱审计结果
-    highlightOrigin: null // 最近一次 highlight-node 请求来源（'diff' / 'modal'），用于定位高亮失败提示
+    visualAudit: null,   // 最近一次视觉顺序审计结果
+    highlightOrigin: null // 最近一次 highlight-node 请求来源（'diff' / 'modal' / 'visual'），用于定位高亮失败提示
   };
 
   /* ---------------- 示例输入 ---------------- */
@@ -319,6 +330,7 @@
     } else if (d.type === 'highlight-miss') {
       var missText = '未能在当前预览中定位该节点（可能刚被移除或选择器已变化）。';
       if (state.highlightOrigin === 'modal') setModalHint(missText);
+      else if (state.highlightOrigin === 'visual') setVisualHint(missText);
       else setDiffHint(missText);
       state.highlightOrigin = null;
     } else if (d.type === 'error') {
@@ -332,6 +344,7 @@
     state.order = payload.order || [];
     state.diagnostics = payload.diagnostics || [];
     state.modalAudit = payload.modalAudit || null;
+    state.visualAudit = payload.visualAudit || null;
     state.stats = payload.stats || null;
     state.currentStep = -1;
     renderResults();
@@ -549,6 +562,7 @@
     });
 
     renderModalAudit();
+    renderVisualAudit();
   }
 
   /* ---------------- 模态焦点陷阱审计 ---------------- */
@@ -751,6 +765,166 @@
     }
     els.prevBtn.disabled = total === 0;
     els.nextBtn.disabled = total === 0;
+  }
+
+  /* ---------------- 视觉顺序审计 ---------------- */
+
+  var VISUAL_TYPE_META = {
+    'inline-backward': { label: '行内逆向', cls: 'inline-backward' },
+    'row-backward': { label: '跨行逆向', cls: 'row-backward' }
+  };
+  var VISUAL_REASON_META = {
+    'zero-size': { label: '零尺寸', cls: 'zero-size' },
+    'rect-overlap': { label: '矩形重叠', cls: 'rect-overlap' },
+    'row-ambiguous': { label: '行归属不唯一', cls: 'row-ambiguous' },
+    'cross-scroll-container': { label: '跨滚动容器', cls: 'cross-scroll' }
+  };
+
+  function setVisualHint(text) {
+    els.visualHint.textContent = text || '';
+  }
+
+  function clearVisualActive() {
+    var all = els.visualPanel.querySelectorAll('.diff-item.active');
+    for (var i = 0; i < all.length; i++) all[i].classList.remove('active');
+  }
+
+  /** 滚动容器 id → 展示标签（analyzer 回传的 containers 目录） */
+  function visualContainerLabel(id) {
+    var cs = (state.visualAudit && state.visualAudit.containers) || [];
+    for (var i = 0; i < cs.length; i++) {
+      if (cs[i].id === id) {
+        return cs[i].kind === 'document' ? '文档根滚动容器' : cs[i].label;
+      }
+    }
+    return id || '未知容器';
+  }
+
+  function renderVisualAudit() {
+    var audit = state.visualAudit;
+    els.visualDeviationList.innerHTML = '';
+    els.visualUndeterminedList.innerHTML = '';
+    els.visualMeta.textContent = '';
+    setVisualHint('');
+
+    if (!audit) {
+      els.visualCount.textContent = '0';
+      var tip0 = document.createElement('li');
+      tip0.className = 'empty-tip';
+      tip0.textContent = '尚无审计结果。';
+      els.visualDeviationList.appendChild(tip0);
+      return;
+    }
+
+    var devs = audit.deviations || [];
+    var unds = audit.undetermined || [];
+    var st = audit.stats || {};
+    els.visualCount.textContent = String(devs.length + unds.length);
+    els.visualMeta.textContent =
+      '文档方向 ' + (audit.direction === 'rtl' ? 'RTL（右→左）' : 'LTR（左→右）') +
+      ' · 滚动容器 ' + ((audit.containers || []).length) + ' 个' +
+      ' · 相邻 Tab 对 ' + (st.pairs || 0) + '（可判定 ' + (st.comparablePairs || 0) + '）' +
+      ' · 偏差 ' + devs.length + ' · 无法判定 ' + unds.length;
+
+    // 偏差列表
+    if ((st.nodes || 0) === 0) {
+      var tipN = document.createElement('li');
+      tipN.className = 'empty-tip';
+      tipN.textContent = '当前没有可 Tab 聚焦的节点，无需视觉顺序审计。';
+      els.visualDeviationList.appendChild(tipN);
+    } else if (devs.length === 0) {
+      var tipD = document.createElement('li');
+      tipD.className = 'empty-tip';
+      tipD.textContent = '在可判定的相邻 Tab 对中，未发现视觉顺序偏差。';
+      els.visualDeviationList.appendChild(tipD);
+    }
+    devs.forEach(function (dv) {
+      var meta = VISUAL_TYPE_META[dv.type] || { label: dv.type, cls: '' };
+      var li = document.createElement('li');
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'diff-item ' + meta.cls;
+
+      var line = document.createElement('span');
+      var badge = document.createElement('span');
+      badge.className = 'type-badge ' + meta.cls;
+      badge.textContent = meta.label;
+      line.appendChild(badge);
+      line.appendChild(document.createTextNode(
+        ' 第 ' + dv.fromStep + ' 步 ' + (dv.fromLabel || '') +
+        ' → 第 ' + dv.toStep + ' 步 ' + (dv.toLabel || '')));
+      btn.appendChild(line);
+
+      var detail = document.createElement('span');
+      detail.className = 'diff-detail';
+      detail.textContent = dv.message + '（' + visualContainerLabel(dv.container) + '）';
+      btn.appendChild(detail);
+
+      var sel = document.createElement('span');
+      sel.className = 'sel';
+      sel.textContent = dv.fromSelector + '  →  ' + dv.toSelector;
+      btn.appendChild(sel);
+
+      // 点击联动现有预览高亮：先高亮前一节点，再高亮后一节点
+      btn.addEventListener('click', function () {
+        clearVisualActive();
+        btn.classList.add('active');
+        setVisualHint('依次高亮偏差对的两个节点：第 ' + dv.fromStep + ' 步 → 第 ' + dv.toStep + ' 步。');
+        state.highlightOrigin = 'visual';
+        sendToFrame({ type: 'highlight', step: dv.fromStep - 1 });
+        setTimeout(function () {
+          sendToFrame({ type: 'highlight', step: dv.toStep - 1 });
+        }, 180);
+      });
+      li.appendChild(btn);
+      els.visualDeviationList.appendChild(li);
+    });
+
+    // 无法判定列表
+    if (unds.length === 0) {
+      var tipU = document.createElement('li');
+      tipU.className = 'empty-tip';
+      tipU.textContent = '没有无法判定的节点。';
+      els.visualUndeterminedList.appendChild(tipU);
+    }
+    unds.forEach(function (u) {
+      var meta = VISUAL_REASON_META[u.reason] || { label: u.reason, cls: '' };
+      var li = document.createElement('li');
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'diff-item ' + meta.cls;
+
+      var line = document.createElement('span');
+      var badge = document.createElement('span');
+      badge.className = 'type-badge ' + meta.cls;
+      badge.textContent = meta.label;
+      line.appendChild(badge);
+      line.appendChild(document.createTextNode(' 第 ' + u.step + ' 步 ' + (u.label || '')));
+      btn.appendChild(line);
+
+      var detail = document.createElement('span');
+      detail.className = 'diff-detail';
+      detail.textContent = u.message + (u.container ? '（' + visualContainerLabel(u.container) + '）' : '');
+      btn.appendChild(detail);
+
+      if (u.selector) {
+        var sel = document.createElement('span');
+        sel.className = 'sel';
+        sel.textContent = u.selector;
+        btn.appendChild(sel);
+      }
+
+      // 无法判定节点均在 Tab 顺序中：复用现有步进高亮（实线框 + Tab 角标）
+      btn.addEventListener('click', function () {
+        clearVisualActive();
+        btn.classList.add('active');
+        setVisualHint('');
+        state.highlightOrigin = 'visual';
+        sendToFrame({ type: 'highlight', step: u.step - 1 });
+      });
+      li.appendChild(btn);
+      els.visualUndeterminedList.appendChild(li);
+    });
   }
 
   /* ---------------- 基线对比 ---------------- */
@@ -1037,6 +1211,15 @@
         diagnostics: state.modalAudit.diagnostics,
         candidates: state.modalAudit.candidates
       } : null,
+      // 视觉顺序审计：文档方向 / 滚动容器目录 / 偏差（相邻 Tab 对视觉逆向）/
+      // 无法判定节点及原因（零尺寸 / 矩形重叠 / 行归属不唯一 / 跨滚动容器）
+      visualAudit: state.visualAudit ? {
+        direction: state.visualAudit.direction,
+        containers: state.visualAudit.containers,
+        deviations: state.visualAudit.deviations,
+        undetermined: state.visualAudit.undetermined,
+        stats: state.visualAudit.stats
+      } : null,
       // 基线对比：基线摘要 + 匹配结果 + 差异（未钉基线时为 null）
       baselineComparison: state.diff ? {
         baseline: state.diff.baseline,
@@ -1079,6 +1262,7 @@
       order: [els.tabOrder, els.orderList],
       excluded: [els.tabExcluded, els.excludedPanel],
       modal: [els.tabModal, els.modalPanel],
+      visual: [els.tabVisual, els.visualPanel],
       baseline: [els.tabBaseline, els.baselinePanel]
     };
     Object.keys(tabs).forEach(function (name) {
@@ -1091,6 +1275,7 @@
   els.tabOrder.addEventListener('click', function () { switchTab('order'); });
   els.tabExcluded.addEventListener('click', function () { switchTab('excluded'); });
   els.tabModal.addEventListener('click', function () { switchTab('modal'); });
+  els.tabVisual.addEventListener('click', function () { switchTab('visual'); });
   els.tabBaseline.addEventListener('click', function () { switchTab('baseline'); });
 
   /* ---------------- 启动 ---------------- */
@@ -1102,6 +1287,7 @@
   els.html.value = SAMPLE_HTML;
   els.css.value = SAMPLE_CSS;
   renderBaselinePanel();
+  renderVisualAudit();
 
   fetch('/analyzer.js')
     .then(function (res) {
