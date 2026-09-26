@@ -25,6 +25,7 @@ async function check(name, fn) {
     const body = await res.text();
     if (!body.includes('键盘焦点路线实验室')) throw new Error('缺少页面标题');
     if (!body.includes('模态审计')) throw new Error('缺少模态审计标签页');
+    if (!body.includes('视觉审计')) throw new Error('缺少视觉审计标签页');
   });
 
   await check('GET /analyzer.js 可加载', async () => {
@@ -36,6 +37,7 @@ async function check(name, fn) {
     if (!body.includes('buildShadowDiagnostics')) throw new Error('缺少 Shadow DOM 诊断逻辑');
     if (!body.includes('assignedElements')) throw new Error('缺少 slot 组合树展开');
     if (!body.includes('shadow-closed-undetermined')) throw new Error('缺少 closed 根不可检查标记');
+    if (!body.includes('computeVisualOrderAudit')) throw new Error('缺少视觉顺序审计逻辑');
   });
 
   await check('GET /app.js 包含声明式 Shadow DOM 净化', async () => {
@@ -46,6 +48,7 @@ async function check(name, fn) {
       throw new Error('缺少 DSD 属性中性化 / 还原');
     }
     if (!body.includes('shadowrootmode')) throw new Error('未保留 shadowrootmode 支持');
+    if (!body.includes('renderVisualAudit')) throw new Error('缺少视觉顺序审计渲染');
   });
 
   await check('GET /diff.js 可加载', async () => {

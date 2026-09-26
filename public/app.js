@@ -12,8 +12,12 @@
  *     状态切换与未匹配项，点击差异项联动预览高亮；
  *  6. 模态焦点陷阱审计：展示活动模态身份、模态内焦点循环路线、模态外
  *     泄漏节点与审计诊断，点击循环 / 泄漏节点联动预览高亮；
- *  7. 汇总报告（含基线摘要、匹配结果与差异、模态审计）经 POST /api/export
- *     导出为 JSON 附件。
+ *  7. 视觉顺序审计：展示预览内可 Tab 节点实际矩形的视觉重排结果——
+ *     Tab 路线相邻却视觉逆向跳转的焦点对（偏差），以及零尺寸 / 矩形重叠 /
+ *     跨滚动容器 / 行归属不唯一的「无法判定」项（不计作无偏差），
+ *     点击偏差项联动预览高亮；
+ *  8. 汇总报告（含基线摘要、匹配结果与差异、模态审计、视觉顺序审计）
+ *     经 POST /api/export 导出为 JSON 附件。
  */
 (function () {
   'use strict';
@@ -67,7 +71,14 @@
     modalCycleWrap: document.getElementById('modal-cycle-wrap'),
     modalLeakList: document.getElementById('modal-leak-list'),
     modalDiagnosticsList: document.getElementById('modal-diagnostics-list'),
-    modalHint: document.getElementById('modal-hint')
+    modalHint: document.getElementById('modal-hint'),
+    tabVisual: document.getElementById('tab-visual'),
+    visualPanel: document.getElementById('visual-panel'),
+    visualCount: document.getElementById('visual-count'),
+    visualSummary: document.getElementById('visual-summary'),
+    visualDeviationList: document.getElementById('visual-deviation-list'),
+    visualUndeterminedList: document.getElementById('visual-undetermined-list'),
+    visualHint: document.getElementById('visual-hint')
   };
 
   var state = {
@@ -82,7 +93,8 @@
     baseline: null,      // 已钉住的基线快照 { pinnedAt, stats, entries }
     diff: null,          // 最近一次基线对比结果（FocusDiff.diffRoutes 返回值）
     modalAudit: null,    // 最近一次模态焦点陷阱审计结果
-    highlightOrigin: null // 最近一次 highlight-node 请求来源（'diff' / 'modal'），用于定位高亮失败提示
+    visualAudit: null,   // 最近一次视觉顺序审计结果
+    highlightOrigin: null // 最近一次 highlight-node 请求来源（'diff' / 'modal' / 'visual'），用于定位高亮失败提示
   };
 
   /* ---------------- 示例输入 ---------------- */
@@ -319,6 +331,7 @@
     } else if (d.type === 'highlight-miss') {
       var missText = '未能在当前预览中定位该节点（可能刚被移除或选择器已变化）。';
       if (state.highlightOrigin === 'modal') setModalHint(missText);
+      else if (state.highlightOrigin === 'visual') setVisualHint(missText);
       else setDiffHint(missText);
       state.highlightOrigin = null;
     } else if (d.type === 'error') {
@@ -332,6 +345,7 @@
     state.order = payload.order || [];
     state.diagnostics = payload.diagnostics || [];
     state.modalAudit = payload.modalAudit || null;
+    state.visualAudit = payload.visualAudit || null;
     state.stats = payload.stats || null;
     state.currentStep = -1;
     renderResults();
@@ -345,6 +359,9 @@
       if (sh.slottedCandidates > 0) parts.push(sh.slottedCandidates + ' 个经 slot 分配');
       if (sh.fallbackCandidates > 0) parts.push(sh.fallbackCandidates + ' 个 fallback');
       if (parts.length > 0) shNote = ' · 组合树：' + parts.join('，');
+    }
+    if (state.visualAudit && state.visualAudit.stats && state.visualAudit.stats.deviations > 0) {
+      shNote += ' · ⚠ 视觉偏差 ' + state.visualAudit.stats.deviations + ' 处';
     }
     setStatus('已计算：' + state.order.length + ' 个可聚焦节点' + shNote, 'ok');
 
@@ -549,6 +566,7 @@
     });
 
     renderModalAudit();
+    renderVisualAudit();
   }
 
   /* ---------------- 模态焦点陷阱审计 ---------------- */
@@ -739,6 +757,180 @@
       li.className = 'diag ' + (dg.level === 'warn' ? 'warn' : 'info');
       li.textContent = (dg.level === 'warn' ? '⚠ ' : 'ℹ ') + dg.message;
       els.modalDiagnosticsList.appendChild(li);
+    });
+  }
+
+  /* ---------------- 视觉顺序审计 ---------------- */
+
+  var VA_REASON_META = {
+    'zero-size': { label: '零尺寸' },
+    'overlap': { label: '矩形重叠' },
+    'row-ambiguous': { label: '行归属不唯一' },
+    'cross-container': { label: '跨滚动容器' }
+  };
+
+  function setVisualHint(text) {
+    els.visualHint.textContent = text || '';
+  }
+
+  function clearVisualActive() {
+    var all = els.visualPanel.querySelectorAll('.diff-item.active');
+    for (var i = 0; i < all.length; i++) all[i].classList.remove('active');
+  }
+
+  function visualContainerLabel(audit, id) {
+    var cs = audit.containers || [];
+    for (var i = 0; i < cs.length; i++) {
+      if (cs[i].id === id) return cs[i].label;
+    }
+    return '容器 ' + id;
+  }
+
+  function renderVisualAudit() {
+    var audit = state.visualAudit;
+    els.visualSummary.innerHTML = '';
+    els.visualDeviationList.innerHTML = '';
+    els.visualUndeterminedList.innerHTML = '';
+    setVisualHint('');
+
+    if (!audit || !audit.stats) {
+      els.visualCount.textContent = '0';
+      var tip0 = document.createElement('li');
+      tip0.className = 'empty-tip';
+      tip0.textContent = '尚无视觉顺序审计结果。';
+      els.visualDeviationList.appendChild(tip0);
+      return;
+    }
+
+    var st = audit.stats;
+    // 角标计数 = 偏差数 + 无法判定条目数（无法判定不计作无偏差）
+    els.visualCount.textContent = String(st.deviations + st.undetermined);
+
+    // 摘要 chips：方向 / 滚动容器 / 相邻对 / 一致 / 偏差 / 无法判定
+    var chips = [
+      ['方向 ' + (audit.direction === 'rtl' ? 'RTL' : 'LTR'), ''],
+      ['滚动容器 ' + (audit.containers || []).length, ''],
+      ['相邻对 ' + st.pairs, ''],
+      ['=' + st.okPairs + ' 一致', 'unchanged'],
+      ['⚠' + st.deviations + ' 偏差', 'deviation'],
+      ['◆' + st.undetermined + ' 无法判定', 'undetermined']
+    ];
+    chips.forEach(function (c) {
+      var chip = document.createElement('span');
+      chip.className = 'diff-chip' + (c[1] ? ' ' + c[1] : '');
+      chip.textContent = c[0];
+      els.visualSummary.appendChild(chip);
+    });
+
+    // 偏差列表：Tab 路线相邻却视觉逆向跳转的焦点对
+    if (audit.deviations.length === 0) {
+      var liE = document.createElement('li');
+      liE.className = 'empty-tip';
+      if (st.nodes === 0) {
+        liE.textContent = '没有可 Tab 聚焦的节点，无法进行视觉顺序审计。';
+      } else if (st.pairs === 0) {
+        liE.textContent = '可 Tab 节点不足两个，没有可比较的相邻对。';
+      } else if (st.comparedPairs === 0) {
+        liE.textContent = '相邻对均无法判定，没有可明确比较的节点对（见下方「无法判定」）。';
+      } else {
+        liE.textContent = '已比较的 ' + st.comparedPairs + ' 对相邻焦点未发现视觉逆向偏差。' +
+          (st.undetermined > 0 ? '（另有 ' + st.undetermined + ' 项无法判定，不计作无偏差。）' : '');
+      }
+      els.visualDeviationList.appendChild(liE);
+    }
+    audit.deviations.forEach(function (dv) {
+      var li = document.createElement('li');
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'diff-item deviation';
+
+      var line = document.createElement('span');
+      var badge = document.createElement('span');
+      badge.className = 'type-badge deviation';
+      badge.textContent = '偏差';
+      line.appendChild(badge);
+      line.appendChild(document.createTextNode(' 第 ' + dv.from.step + ' 位 → 第 ' + dv.to.step + ' 位'));
+      btn.appendChild(line);
+
+      var detail = document.createElement('span');
+      detail.className = 'diff-detail';
+      detail.textContent = dv.from.label + ' → ' + dv.to.label +
+        '：' + visualContainerLabel(audit, dv.from.container) + ' 内视觉名次 第 ' +
+        dv.fromVisualRank + ' → 第 ' + dv.toVisualRank + '（逆向跳转）';
+      btn.appendChild(detail);
+
+      [dv.from, dv.to].forEach(function (nd) {
+        var sel = document.createElement('span');
+        sel.className = 'sel';
+        sel.textContent = '#' + nd.step + ' ' + nd.selector;
+        btn.appendChild(sel);
+      });
+
+      btn.addEventListener('click', function () {
+        clearVisualActive();
+        btn.classList.add('active');
+        setVisualHint('已定位偏差起点（第 ' + dv.from.step + ' 位）；在预览中按 Tab ⇥ 可体验跳到第 ' +
+          dv.to.step + ' 位的视觉逆向跳转。');
+        sendToFrame({ type: 'highlight', step: dv.from.step - 1 }); // step 为 1 基序号
+      });
+      li.appendChild(btn);
+      els.visualDeviationList.appendChild(li);
+    });
+
+    // 无法判定列表：零尺寸 / 矩形重叠 / 行归属不唯一 / 跨滚动容器
+    if (audit.undetermined.length === 0) {
+      var liU = document.createElement('li');
+      liU.className = 'empty-tip';
+      liU.textContent = '没有无法判定的节点或焦点对。';
+      els.visualUndeterminedList.appendChild(liU);
+    }
+    audit.undetermined.forEach(function (u) {
+      var meta = VA_REASON_META[u.reason] || { label: u.reason };
+      var li = document.createElement('li');
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'diff-item undetermined';
+
+      var line = document.createElement('span');
+      var badge = document.createElement('span');
+      badge.className = 'type-badge undetermined';
+      badge.textContent = meta.label;
+      line.appendChild(badge);
+      line.appendChild(document.createTextNode(' ' + u.nodes.map(function (nd) {
+        return '第 ' + nd.step + ' 位 ' + nd.label;
+      }).join(' ↔ ')));
+      btn.appendChild(line);
+
+      var detail = document.createElement('span');
+      detail.className = 'diff-detail';
+      detail.textContent = u.message +
+        (u.reason === 'cross-container' && u.nodes.length > 1
+          ? '（' + visualContainerLabel(audit, u.nodes[0].container) + ' ↔ ' +
+            visualContainerLabel(audit, u.nodes[1].container) + '）'
+          : '');
+      btn.appendChild(detail);
+
+      u.nodes.forEach(function (nd) {
+        var sel = document.createElement('span');
+        sel.className = 'sel';
+        sel.textContent = '#' + nd.step + ' ' + nd.selector +
+          '  rect(' + nd.rect.left + ',' + nd.rect.top + ' ' + nd.rect.width + '×' + nd.rect.height + ')';
+        btn.appendChild(sel);
+      });
+
+      btn.addEventListener('click', function () {
+        clearVisualActive();
+        btn.classList.add('active');
+        setVisualHint('');
+        state.highlightOrigin = 'visual';
+        sendToFrame({
+          type: 'highlight-node',
+          selector: u.nodes[0].selector,
+          badge: '无法判定 · ' + meta.label
+        });
+      });
+      li.appendChild(btn);
+      els.visualUndeterminedList.appendChild(li);
     });
   }
 
@@ -1037,6 +1229,14 @@
         diagnostics: state.modalAudit.diagnostics,
         candidates: state.modalAudit.candidates
       } : null,
+      // 视觉顺序审计：文档方向 / 滚动容器分组 / 视觉逆向偏差 / 无法判定原因（无结果时为 null）
+      visualAudit: state.visualAudit ? {
+        direction: state.visualAudit.direction,
+        containers: state.visualAudit.containers,
+        stats: state.visualAudit.stats,
+        deviations: state.visualAudit.deviations,
+        undetermined: state.visualAudit.undetermined
+      } : null,
       // 基线对比：基线摘要 + 匹配结果 + 差异（未钉基线时为 null）
       baselineComparison: state.diff ? {
         baseline: state.diff.baseline,
@@ -1079,6 +1279,7 @@
       order: [els.tabOrder, els.orderList],
       excluded: [els.tabExcluded, els.excludedPanel],
       modal: [els.tabModal, els.modalPanel],
+      visual: [els.tabVisual, els.visualPanel],
       baseline: [els.tabBaseline, els.baselinePanel]
     };
     Object.keys(tabs).forEach(function (name) {
@@ -1091,6 +1292,7 @@
   els.tabOrder.addEventListener('click', function () { switchTab('order'); });
   els.tabExcluded.addEventListener('click', function () { switchTab('excluded'); });
   els.tabModal.addEventListener('click', function () { switchTab('modal'); });
+  els.tabVisual.addEventListener('click', function () { switchTab('visual'); });
   els.tabBaseline.addEventListener('click', function () { switchTab('baseline'); });
 
   /* ---------------- 启动 ---------------- */

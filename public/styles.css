@@ -331,3 +331,18 @@ textarea:focus { outline: 2px solid var(--accent-2); outline-offset: -1px; }
 .badge.leak { background: #3a2333; color: var(--accent); }
 
 .modal-panel .node-item.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+
+/* ---------------- 视觉顺序审计 ---------------- */
+
+/* 面板整体滚动：与模态面板一致，hidden 属性可正常隐藏 */
+.visual-panel { flex: 1; min-height: 0; overflow-y: auto; }
+.visual-panel h3 { font-size: 13px; color: var(--muted); margin: 12px 0 6px; }
+
+.diff-chip.deviation { color: var(--accent); }
+.diff-chip.undetermined { color: var(--warn); }
+
+.diff-item.deviation { border-left-color: var(--accent); }
+.diff-item.undetermined { border-left-color: var(--warn); }
+
+.type-badge.deviation { background: #3a2333; color: var(--accent); }
+.type-badge.undetermined { background: #3d2b12; color: var(--warn); }
